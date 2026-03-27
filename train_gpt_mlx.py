@@ -93,6 +93,24 @@ class Hyperparameters:
     muon_momentum_warmup_start: float = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps: int = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     grad_clip_norm: float = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    # Sliding window eval stride. 0 = disabled (fast non-sliding eval only).
+    # Set to 64 to match leaderboard scoring; each token gets near-full context.
+    eval_stride: int = int(os.environ.get("EVAL_STRIDE", 0))
+
+    # TTT: score-first test-time training on already-evaluated val chunks.
+    ttt_enabled: bool = bool(int(os.environ.get("TTT_ENABLED", "0")))
+    ttt_chunk_tokens: int = int(os.environ.get("TTT_CHUNK_TOKENS", 32_768))
+    ttt_lr: float = float(os.environ.get("TTT_LR", 0.002))
+    ttt_epochs: int = int(os.environ.get("TTT_EPOCHS", 3))
+    ttt_momentum: float = float(os.environ.get("TTT_MOMENTUM", 0.9))
+    ttt_grad_clip: float = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
+    ttt_batch_seqs: int = int(os.environ.get("TTT_BATCH_SEQS", 32))
+
+    # Bigram mixing: two-level online KT table mixed into neural logits.
+    bigram_mix_enabled: bool = bool(int(os.environ.get("BIGRAM_MIX_ENABLED", "0")))
+    bigram_mix_alpha_init: float = float(os.environ.get("BIGRAM_MIX_ALPHA_INIT", 0.1))
+    bigram_mix_alpha_lr: float = float(os.environ.get("BIGRAM_MIX_ALPHA_LR", 0.01))
+    bigram_mix_alpha_max: float = float(os.environ.get("BIGRAM_MIX_ALPHA_MAX", 2.0))
 
     out_dir: str = os.environ.get("OUT_DIR", "logs")
 
@@ -813,6 +831,304 @@ def eval_val(
     val_bpb = bits_per_token * (total_tokens / total_bytes)
     return val_loss, val_bpb
 
+
+def eval_val_sliding(
+    args: Hyperparameters,
+    model,
+    val_tokens: np.ndarray,
+    base_bytes_lut: np.ndarray,
+    has_leading_space_lut: np.ndarray,
+    is_boundary_token_lut: np.ndarray,
+    stride: int,
+    batch_seqs: int = 32,
+    log_fn: Callable[[str], None] | None = None,
+) -> tuple[float, float]:
+    """Sliding window evaluation: each token scored with near-maximal context.
+
+    Windows of train_seq_len advance by stride. Only the last stride tokens
+    per window contribute to the score (except the first window, which scores
+    all its tokens). Matches the leaderboard scoring protocol when stride=64.
+    """
+    seq_len = args.train_seq_len
+    total_tokens = val_tokens.size - 1
+
+    window_starts = [ws for ws in range(0, total_tokens, stride)
+                     if min(ws + seq_len, total_tokens) - ws >= 1]
+    total_windows = len(window_starts)
+
+    loss_sum = 0.0
+    token_count = 0.0
+    byte_count = 0.0
+
+    for bi in range(0, total_windows, batch_seqs):
+        batch_ws = window_starts[bi:bi + batch_seqs]
+        bsz = len(batch_ws)
+
+        x_np = np.zeros((bsz, seq_len), dtype=np.int32)
+        y_np = np.zeros((bsz, seq_len), dtype=np.int32)
+        wlens: list[int] = []
+
+        for i, ws in enumerate(batch_ws):
+            end = min(ws + seq_len, total_tokens)
+            wlen = end - ws
+            wlens.append(wlen)
+            chunk = val_tokens[ws:end + 1]
+            x_np[i, :wlen] = chunk[:-1]
+            y_np[i, :wlen] = chunk[1:]
+
+        x = mx.array(x_np, dtype=mx.int32)
+        y = mx.array(y_np, dtype=mx.int32)
+
+        # hidden [bsz, seq_len, dim] -> logits [bsz*seq_len, vocab] -> per-token NLL
+        hidden = model(x).reshape(bsz * seq_len, -1)
+        logits = model.softcap(hidden @ model.tok_emb.weight.astype(hidden.dtype).T)
+        nll = nn.losses.cross_entropy(logits.astype(mx.float32), y.reshape(-1), reduction="none")
+        mx.eval(nll)
+        nll_np = np.array(nll, dtype=np.float64).reshape(bsz, seq_len)
+
+        for i, ws in enumerate(batch_ws):
+            wlen = wlens[i]
+            s = 0 if ws == 0 else max(wlen - stride, 0)
+            loss_sum += nll_np[i, s:wlen].sum()
+            token_count += float(wlen - s)
+            tgt = y_np[i, s:wlen]
+            prev = x_np[i, s:wlen]
+            bytes_here = base_bytes_lut[tgt].astype(np.int16, copy=True)
+            bytes_here += (
+                has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]
+            ).astype(np.int16)
+            byte_count += float(bytes_here.astype(np.float64).sum())
+
+        if log_fn is not None and (
+            bi == 0 or bi + batch_seqs >= total_windows or (bi // batch_seqs) % 50 == 0
+        ):
+            done = min(bi + batch_seqs, total_windows)
+            pct = done / total_windows * 100
+            running_bpb = (loss_sum / token_count) / math.log(2.0) * (token_count / byte_count) if token_count > 0 else 0.0
+            log_fn(f"sliding_eval_progress:{done}/{total_windows} ({pct:.1f}%) running_bpb:{running_bpb:.6f}")
+
+    val_loss = loss_sum / token_count
+    val_bpb = (val_loss / math.log(2.0)) * (token_count / byte_count)
+    return val_loss, val_bpb
+
+# ==============================================================================
+# TEST-TIME TRAINING + BIGRAM MIXING
+# ==============================================================================
+
+class BigramState:
+    """Online two-level bigram count table with KT smoothing.
+
+    Global table accumulates all past scored val tokens.
+    Local table resets at each BOS token (document boundary).
+    lambda(a) = N_local[a] / (N_local[a] + V/2) is count-adaptive:
+    near 0 early in a doc (fall back to global), near 1 after many observations.
+    alpha (neural vs bigram blend) is updated online per chunk via PAQ-style
+    gradient: increase when bigram beats neural, decrease otherwise.
+    """
+
+    def __init__(self, vocab_size: int, alpha_init: float, alpha_lr: float, alpha_max: float) -> None:
+        self.V = vocab_size
+        self.alpha = alpha_init
+        self.alpha_lr = alpha_lr
+        self.alpha_max = alpha_max
+        self.C_global = np.zeros((vocab_size, vocab_size), dtype=np.int32)
+        self.C_local  = np.zeros((vocab_size, vocab_size), dtype=np.int32)
+        self.N_global = np.zeros(vocab_size, dtype=np.int32)
+        self.N_local  = np.zeros(vocab_size, dtype=np.int32)
+
+    def reset_local(self) -> None:
+        self.C_local[:] = 0
+        self.N_local[:] = 0
+
+    def update(self, prev_toks: np.ndarray, cur_toks: np.ndarray, bos_id: int) -> None:
+        """Vectorized count update. Resets local table at each BOS occurrence."""
+        bos_pos  = list(np.where(cur_toks == bos_id)[0])
+        segments = [-1] + bos_pos + [len(cur_toks)]
+        for k in range(len(segments) - 1):
+            s, e = segments[k] + 1, segments[k + 1]
+            if s < e:
+                a, b = prev_toks[s:e], cur_toks[s:e]
+                np.add.at(self.C_global, (a, b), 1)
+                np.add.at(self.N_global, a, 1)
+                np.add.at(self.C_local,  (a, b), 1)
+                np.add.at(self.N_local,  a, 1)
+            if segments[k + 1] < len(cur_toks):
+                self.reset_local()
+
+    def log_prob_matrix(self) -> np.ndarray:
+        """log P_bigram[a, b] as float32 [V, V].
+
+        P(b|a) = lambda(a)*P_local(b|a) + (1-lambda(a))*P_global(b|a)
+        Each P_* is a KT estimate (Dirichlet(0.5) prior); convex combination
+        keeps the result on the simplex.
+        """
+        half = 0.5
+        V    = self.V
+        Ng   = (self.N_global.astype(np.float64) + V * half)[:, None]
+        Nl   = (self.N_local.astype(np.float64)  + V * half)[:, None]
+        P_g  = (self.C_global.astype(np.float64) + half) / Ng
+        P_l  = (self.C_local.astype(np.float64)  + half) / Nl
+        lam  = (self.N_local.astype(np.float64) / (self.N_local.astype(np.float64) + V * half))[:, None]
+        P    = lam * P_l + (1.0 - lam) * P_g
+        return np.log(P + 1e-40).astype(np.float32)
+
+    def update_alpha(self, sc_prev: np.ndarray, sc_tgt: np.ndarray,
+                     nll_neural: np.ndarray, log_P: np.ndarray) -> None:
+        """PAQ-style per-chunk alpha update.
+
+        alpha increases when bigram beats neural on average, decreases otherwise.
+        """
+        nll_bigram = -log_P[sc_prev, sc_tgt].astype(np.float64)
+        delta = float(nll_neural.astype(np.float64).mean()) - float(nll_bigram.mean())
+        self.alpha = float(np.clip(self.alpha + self.alpha_lr * delta, 0.0, self.alpha_max))
+
+
+def eval_val_ttt(
+    args: Hyperparameters,
+    model,
+    val_tokens: np.ndarray,
+    base_bytes_lut: np.ndarray,
+    has_leading_space_lut: np.ndarray,
+    is_boundary_token_lut: np.ndarray,
+    bos_id: int = 1,
+    log_fn: Callable[[str], None] | None = None,
+) -> tuple[float, float]:
+    """Score-first TTT eval with optional online bigram mixing.
+
+    For each chunk of ttt_chunk_tokens:
+      SCORE — sliding window eval (stride = eval_stride or 64);
+              accumulates BPB, bigram NLLs for alpha update.
+      TRAIN — SGD(momentum) on the already-scored chunk, ttt_epochs passes.
+    The last chunk is scored but not trained on (no future leakage).
+    Bigram mixing (if enabled) adds alpha * log P_bigram to neural logits
+    during scoring. Alpha is updated per-chunk via PAQ gradient.
+    """
+    stride     = args.eval_stride if args.eval_stride > 0 else 64
+    seq_len    = args.train_seq_len
+    batch_seqs = args.ttt_batch_seqs
+    total_toks = val_tokens.size - 1
+
+    chunk_starts = list(range(0, total_toks, args.ttt_chunk_tokens))
+    n_chunks     = len(chunk_starts)
+
+    bigram: BigramState | None = None
+    if args.bigram_mix_enabled:
+        bigram = BigramState(
+            args.vocab_size, args.bigram_mix_alpha_init,
+            args.bigram_mix_alpha_lr, args.bigram_mix_alpha_max,
+        )
+
+    ttt_loss_grad = nn.value_and_grad(model, lambda x, y: model.loss(x, y))
+    ttt_opt = optim.SGD(learning_rate=args.ttt_lr, momentum=args.ttt_momentum)
+
+    total_loss   = 0.0
+    total_scored = 0.0
+    total_bytes  = 0.0
+
+    for chunk_idx, chunk_start in enumerate(chunk_starts):
+        chunk_end = min(chunk_start + args.ttt_chunk_tokens, total_toks)
+
+        # ── SCORE ────────────────────────────────────────────────────────────
+        log_P_np = bigram.log_prob_matrix() if bigram is not None else None
+        log_P_mx = mx.array(log_P_np) if log_P_np is not None else None
+
+        win_starts = [ws for ws in range(chunk_start, chunk_end, stride)
+                      if min(ws + seq_len, chunk_end) - ws >= 1]
+
+        # Lists for per-chunk alpha update (only used when bigram enabled)
+        sc_prev_list:   list[np.ndarray] = []
+        sc_tgt_list:    list[np.ndarray] = []
+        nll_neural_list: list[np.ndarray] = []
+
+        for bi in range(0, len(win_starts), batch_seqs):
+            batch_ws = win_starts[bi:bi + batch_seqs]
+            bsz = len(batch_ws)
+            x_np = np.zeros((bsz, seq_len), dtype=np.int32)
+            y_np = np.zeros((bsz, seq_len), dtype=np.int32)
+            wlens: list[int] = []
+            for i, ws in enumerate(batch_ws):
+                end  = min(ws + seq_len, chunk_end)
+                wlen = end - ws
+                wlens.append(wlen)
+                sl = val_tokens[ws:end + 1]
+                x_np[i, :wlen] = sl[:-1]
+                y_np[i, :wlen] = sl[1:]
+
+            x = mx.array(x_np, dtype=mx.int32)
+            y = mx.array(y_np, dtype=mx.int32)
+
+            hidden = model(x).reshape(bsz * seq_len, -1)
+            logits = model.softcap(hidden @ model.tok_emb.weight.astype(hidden.dtype).T).astype(mx.float32)
+            nll_base = nn.losses.cross_entropy(logits, y.reshape(-1), reduction="none")
+
+            if log_P_mx is not None:
+                prev_flat   = mx.array(x_np.reshape(-1))
+                correction  = log_P_mx[prev_flat]          # [bsz*seq_len, V]
+                logits_corr = logits + bigram.alpha * correction
+                nll_scored  = nn.losses.cross_entropy(logits_corr, y.reshape(-1), reduction="none")
+                mx.eval(nll_scored, nll_base)
+                nll_neural_np = np.array(nll_base, copy=False).reshape(bsz, seq_len)
+            else:
+                nll_scored = nll_base
+                mx.eval(nll_scored)
+                nll_neural_np = None
+
+            nll_np = np.array(nll_scored, copy=False).reshape(bsz, seq_len)
+
+            for i, ws in enumerate(batch_ws):
+                wlen = wlens[i]
+                s = 0 if ws == chunk_start else max(wlen - stride, 0)
+                total_loss   += nll_np[i, s:wlen].sum()
+                total_scored += float(wlen - s)
+                tgt  = y_np[i, s:wlen]
+                prev = x_np[i, s:wlen]
+                b = base_bytes_lut[tgt].astype(np.int16, copy=True)
+                b += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).astype(np.int16)
+                total_bytes += float(b.astype(np.float64).sum())
+                if bigram is not None:
+                    sc_prev_list.append(prev)
+                    sc_tgt_list.append(tgt)
+                    nll_neural_list.append(nll_neural_np[i, s:wlen])
+
+        # Update bigram state after scoring the whole chunk
+        if bigram is not None and sc_prev_list:
+            all_prev   = np.concatenate(sc_prev_list)
+            all_tgt    = np.concatenate(sc_tgt_list)
+            all_neural = np.concatenate(nll_neural_list)
+            bigram.update_alpha(all_prev, all_tgt, all_neural, log_P_np)
+            chunk_slice = val_tokens[chunk_start:chunk_end + 1]
+            bigram.update(chunk_slice[:-1], chunk_slice[1:], bos_id)
+
+        if log_fn is not None and (chunk_idx % 10 == 0 or chunk_idx == n_chunks - 1):
+            bpb = (total_loss / total_scored) / math.log(2.0) * (total_scored / total_bytes) if total_scored > 0 else 0.0
+            alpha_str = f" alpha:{bigram.alpha:.4f}" if bigram is not None else ""
+            log_fn(f"ttt:{chunk_idx + 1}/{n_chunks} bpb:{bpb:.6f}{alpha_str}")
+
+        # ── TRAIN ────────────────────────────────────────────────────────────
+        if chunk_idx == n_chunks - 1:
+            break  # last chunk: score only, no future leakage
+        n_seqs = (chunk_end - chunk_start) // seq_len
+        if n_seqs == 0:
+            continue
+        raw     = val_tokens[chunk_start:chunk_start + n_seqs * seq_len + 1]
+        x_train = raw[:-1].reshape(n_seqs, seq_len)
+        y_train = raw[1:].reshape(n_seqs, seq_len)
+        for _ in range(args.ttt_epochs):
+            perm = np.random.permutation(n_seqs)
+            for bs in range(0, n_seqs, batch_seqs):
+                x_b = mx.array(x_train[perm[bs:bs + batch_seqs]], dtype=mx.int32)
+                y_b = mx.array(y_train[perm[bs:bs + batch_seqs]], dtype=mx.int32)
+                loss_v, grads = ttt_loss_grad(x_b, y_b)
+                mx.eval(loss_v)
+                if args.ttt_grad_clip > 0:
+                    grads = clip_grad_tree(grads, args.ttt_grad_clip)
+                ttt_opt.update(model, grads)
+                mx.eval(model.state)
+
+    val_loss = total_loss / total_scored
+    val_bpb  = (val_loss / math.log(2.0)) * (total_scored / total_bytes)
+    return val_loss, val_bpb
+
 # -----------------------------
 # TRAINING
 # -----------------------------
@@ -1098,6 +1414,27 @@ def main() -> None:
     q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)
     log(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
     log(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    if args.eval_stride > 0:
+        sw_t0 = time.perf_counter()
+        sw_val_loss, sw_val_bpb = eval_val_sliding(
+            args, model, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            stride=args.eval_stride, log_fn=log,
+        )
+        sw_eval_ms = 1000.0 * (time.perf_counter() - sw_t0)
+        log(f"final_sliding_window stride:{args.eval_stride} val_loss:{sw_val_loss:.4f} val_bpb:{sw_val_bpb:.4f} eval_time:{sw_eval_ms:.0f}ms")
+        log(f"final_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
+
+    if args.ttt_enabled:
+        ttt_t0 = time.perf_counter()
+        ttt_val_loss, ttt_val_bpb = eval_val_ttt(
+            args, model, val_tokens, base_bytes_lut, has_leading_space_lut,
+            is_boundary_token_lut, bos_id=sp.bos_id(), log_fn=log,
+        )
+        ttt_ms = 1000.0 * (time.perf_counter() - ttt_t0)
+        bigram_str = f" bigram_alpha:{args.bigram_mix_alpha_init:.3f}" if args.bigram_mix_enabled else ""
+        log(f"final_ttt chunks:{args.ttt_chunk_tokens} epochs:{args.ttt_epochs} lr:{args.ttt_lr}{bigram_str} val_loss:{ttt_val_loss:.4f} val_bpb:{ttt_val_bpb:.4f} eval_time:{ttt_ms:.0f}ms")
+        log(f"final_ttt_exact val_loss:{ttt_val_loss:.8f} val_bpb:{ttt_val_bpb:.8f}")
 
 
 if __name__ == "__main__":
