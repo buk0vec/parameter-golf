@@ -848,6 +848,8 @@ def eval_val_sliding(
     stride: int,
     batch_seqs: int = 32,
     log_fn: Callable[[str], None] | None = None,
+    bigram: "BigramState | None" = None,
+    bos_id: int = 1,
 ) -> tuple[float, float]:
     """Sliding window evaluation: each token scored with near-maximal context.
 
@@ -887,10 +889,29 @@ def eval_val_sliding(
 
         # hidden [bsz, seq_len, dim] -> logits [bsz*seq_len, vocab] -> per-token NLL
         hidden = model(x).reshape(bsz * seq_len, -1)
-        logits = model.softcap(hidden @ model.tok_emb.weight.astype(hidden.dtype).T)
-        nll = nn.losses.cross_entropy(logits.astype(mx.float32), y.reshape(-1), reduction="none")
-        mx.eval(nll)
+        logits = model.softcap(hidden @ model.tok_emb.weight.astype(hidden.dtype).T).astype(mx.float32)
+
+        log_P_np = bigram.log_prob_matrix() if bigram is not None else None
+        log_P_mx = mx.array(log_P_np) if log_P_np is not None else None
+
+        if log_P_mx is not None:
+            prev_flat  = mx.array(x_np.reshape(-1))
+            correction = log_P_mx[prev_flat]                            # [bsz*seq_len, V]
+            logits_corr = logits + bigram.alpha * correction
+            nll  = nn.losses.cross_entropy(logits_corr, y.reshape(-1), reduction="none")
+            e_lb = (mx.softmax(logits_corr) * correction).sum(axis=-1) # [bsz*seq_len]
+            mx.eval(nll, e_lb)
+            e_lb_np = np.array(e_lb, copy=False).reshape(bsz, seq_len)
+        else:
+            nll = nn.losses.cross_entropy(logits, y.reshape(-1), reduction="none")
+            mx.eval(nll)
+            e_lb_np = None
+
         nll_np = np.array(nll, dtype=np.float64).reshape(bsz, seq_len)
+
+        sc_prev_list: list[np.ndarray] = []
+        sc_tgt_list:  list[np.ndarray] = []
+        sc_elb_list:  list[np.ndarray] = []
 
         for i, ws in enumerate(batch_ws):
             wlen = wlens[i]
@@ -904,6 +925,18 @@ def eval_val_sliding(
                 has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]
             ).astype(np.int16)
             byte_count += float(bytes_here.astype(np.float64).sum())
+            if bigram is not None:
+                sc_prev_list.append(prev)
+                sc_tgt_list.append(tgt)
+                sc_elb_list.append(e_lb_np[i, s:wlen])
+
+        # Score-first: update alpha and bigram counts after scoring this batch
+        if bigram is not None and sc_prev_list:
+            all_prev = np.concatenate(sc_prev_list)
+            all_tgt  = np.concatenate(sc_tgt_list)
+            all_elb  = np.concatenate(sc_elb_list)
+            bigram.update_alpha(all_prev, all_tgt, all_elb, log_P_np)
+            bigram.update(all_prev, all_tgt, bos_id)
 
         if log_fn is not None and (
             bi == 0 or bi + batch_seqs >= total_windows or (bi // batch_seqs) % 50 == 0
@@ -911,7 +944,8 @@ def eval_val_sliding(
             done = min(bi + batch_seqs, total_windows)
             pct = done / total_windows * 100
             running_bpb = (loss_sum / token_count) / math.log(2.0) * (token_count / byte_count) if token_count > 0 else 0.0
-            log_fn(f"sliding_eval_progress:{done}/{total_windows} ({pct:.1f}%) running_bpb:{running_bpb:.6f}")
+            alpha_str = f" alpha:{bigram.alpha:.4f}" if bigram is not None else ""
+            log_fn(f"sliding_eval_progress:{done}/{total_windows} ({pct:.1f}%) running_bpb:{running_bpb:.6f}{alpha_str}")
 
     val_loss = loss_sum / token_count
     val_bpb = (val_loss / math.log(2.0)) * (token_count / byte_count)
@@ -1112,7 +1146,7 @@ def eval_val_ttt(
             chunk_slice = val_tokens[chunk_start:chunk_end + 1]
             bigram.update(chunk_slice[:-1], chunk_slice[1:], bos_id)
 
-        if log_fn is not None and (chunk_idx % 10 == 0 or chunk_idx == n_chunks - 1):
+        if log_fn is not None and (chunk_idx % 10 == 0 or chunk_idx == n_chunks - 1 or (bigram is not None and chunk_idx < 20)):
             bpb = (total_loss / total_scored) / math.log(2.0) * (total_scored / total_bytes) if total_scored > 0 else 0.0
             alpha_str = f" alpha:{bigram.alpha:.4f}" if bigram is not None else ""
             log_fn(f"ttt:{chunk_idx + 1}/{n_chunks} bpb:{bpb:.6f}{alpha_str}")
@@ -1308,11 +1342,17 @@ def main() -> None:
 
         if args.eval_stride > 0 and not args.ttt_enabled:
             sw_t0 = time.perf_counter()
+            sw_bigram = BigramState(
+                args.vocab_size, args.bigram_mix_alpha_init,
+                args.bigram_mix_alpha_lr, args.bigram_mix_alpha_max,
+            ) if args.bigram_mix_enabled else None
             sw_loss, sw_bpb = eval_val_sliding(
                 args, model, val_tokens, base_bytes_lut, has_leading_space_lut,
                 is_boundary_token_lut, stride=args.eval_stride, log_fn=log,
+                bigram=sw_bigram, bos_id=sp.bos_id(),
             )
-            log(f"checkpoint_sliding stride:{args.eval_stride} val_loss:{sw_loss:.4f} val_bpb:{sw_bpb:.4f} eval_time:{1000*(time.perf_counter()-sw_t0):.0f}ms")
+            alpha_str = f" final_alpha:{sw_bigram.alpha:.6f}" if sw_bigram is not None else ""
+            log(f"checkpoint_sliding stride:{args.eval_stride} val_loss:{sw_loss:.4f} val_bpb:{sw_bpb:.4f} eval_time:{1000*(time.perf_counter()-sw_t0):.0f}ms{alpha_str}")
             log(f"checkpoint_sliding_exact val_loss:{sw_loss:.8f} val_bpb:{sw_bpb:.8f}")
 
         if args.ttt_enabled:
@@ -1471,12 +1511,17 @@ def main() -> None:
 
     if args.eval_stride > 0 and not args.ttt_enabled:
         sw_t0 = time.perf_counter()
+        sw_bigram = BigramState(
+            args.vocab_size, args.bigram_mix_alpha_init,
+            args.bigram_mix_alpha_lr, args.bigram_mix_alpha_max,
+        ) if args.bigram_mix_enabled else None
         sw_val_loss, sw_val_bpb = eval_val_sliding(
             args, model, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-            stride=args.eval_stride, log_fn=log,
+            stride=args.eval_stride, log_fn=log, bigram=sw_bigram, bos_id=sp.bos_id(),
         )
         sw_eval_ms = 1000.0 * (time.perf_counter() - sw_t0)
-        log(f"final_sliding_window stride:{args.eval_stride} val_loss:{sw_val_loss:.4f} val_bpb:{sw_val_bpb:.4f} eval_time:{sw_eval_ms:.0f}ms")
+        alpha_str = f" final_alpha:{sw_bigram.alpha:.6f}" if sw_bigram is not None else ""
+        log(f"final_sliding_window stride:{args.eval_stride} val_loss:{sw_val_loss:.4f} val_bpb:{sw_val_bpb:.4f} eval_time:{sw_eval_ms:.0f}ms{alpha_str}")
         log(f"final_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
 
     if args.ttt_enabled:
