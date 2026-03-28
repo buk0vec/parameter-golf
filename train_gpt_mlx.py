@@ -113,6 +113,9 @@ class Hyperparameters:
     bigram_mix_alpha_max: float = float(os.environ.get("BIGRAM_MIX_ALPHA_MAX", 2.0))
 
     out_dir: str = os.environ.get("OUT_DIR", "logs")
+    # Path to a saved .int8.ptz checkpoint. When set, skips training entirely
+    # and runs only the eval suite (simple, sliding window, TTT) on the loaded weights.
+    eval_checkpoint: str = os.environ.get("EVAL_CHECKPOINT", "")
 
     @property
     def train_files(self) -> str:
@@ -1272,6 +1275,45 @@ def main() -> None:
         f"linear_weight:{model.blocks[0].attn.c_q.weight.dtype} "
         f"skip_weights:{model.skip_weights.dtype}"
     )
+
+    # ==============================================================================
+    # CHECKPOINT EVAL MODE (EVAL_CHECKPOINT set → skip training entirely)
+    # ==============================================================================
+    if args.eval_checkpoint:
+        ckpt_path = Path(args.eval_checkpoint)
+        log(f"eval_checkpoint_mode:{ckpt_path} (skipping training)")
+        with ckpt_path.open("rb") as f:
+            blob = f.read()
+        quant_flat = dequantize_state_dict_int8(pickle.loads(zlib.decompress(blob)))
+        model.update(tree_unflatten(list(quant_flat.items())))
+        log(f"checkpoint_loaded bytes:{ckpt_path.stat().st_size}")
+
+        ck_t0 = time.perf_counter()
+        ck_val_loss, ck_val_bpb = eval_val(
+            args, compiled_loss, val_tokens, base_bytes_lut,
+            has_leading_space_lut, is_boundary_token_lut, log_fn=log,
+        )
+        log(f"checkpoint_eval val_loss:{ck_val_loss:.4f} val_bpb:{ck_val_bpb:.4f} eval_time:{1000*(time.perf_counter()-ck_t0):.0f}ms")
+
+        if args.eval_stride > 0:
+            sw_t0 = time.perf_counter()
+            sw_loss, sw_bpb = eval_val_sliding(
+                args, model, val_tokens, base_bytes_lut, has_leading_space_lut,
+                is_boundary_token_lut, stride=args.eval_stride, log_fn=log,
+            )
+            log(f"checkpoint_sliding stride:{args.eval_stride} val_loss:{sw_loss:.4f} val_bpb:{sw_bpb:.4f} eval_time:{1000*(time.perf_counter()-sw_t0):.0f}ms")
+            log(f"checkpoint_sliding_exact val_loss:{sw_loss:.8f} val_bpb:{sw_bpb:.8f}")
+
+        if args.ttt_enabled:
+            ttt_t0 = time.perf_counter()
+            ttt_loss, ttt_bpb = eval_val_ttt(
+                args, model, val_tokens, base_bytes_lut, has_leading_space_lut,
+                is_boundary_token_lut, bos_id=sp.bos_id(), log_fn=log,
+            )
+            bigram_str = f" bigram_alpha:{args.bigram_mix_alpha_init:.3f}" if args.bigram_mix_enabled else ""
+            log(f"checkpoint_ttt chunks:{args.ttt_chunk_tokens} epochs:{args.ttt_epochs} lr:{args.ttt_lr}{bigram_str} val_loss:{ttt_loss:.4f} val_bpb:{ttt_bpb:.4f} eval_time:{1000*(time.perf_counter()-ttt_t0):.0f}ms")
+            log(f"checkpoint_ttt_exact val_loss:{ttt_loss:.8f} val_bpb:{ttt_bpb:.8f}")
+        return
 
     # ==============================================================================
     # TRAINING LOOP
