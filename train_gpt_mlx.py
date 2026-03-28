@@ -1306,7 +1306,7 @@ def main() -> None:
             )
             log(f"checkpoint_eval val_loss:{ck_val_loss:.4f} val_bpb:{ck_val_bpb:.4f} eval_time:{1000*(time.perf_counter()-ck_t0):.0f}ms")
 
-        if args.eval_stride > 0:
+        if args.eval_stride > 0 and not args.ttt_enabled:
             sw_t0 = time.perf_counter()
             sw_loss, sw_bpb = eval_val_sliding(
                 args, model, val_tokens, base_bytes_lut, has_leading_space_lut,
@@ -1469,7 +1469,7 @@ def main() -> None:
         log(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
         log(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
-    if args.eval_stride > 0:
+    if args.eval_stride > 0 and not args.ttt_enabled:
         sw_t0 = time.perf_counter()
         sw_val_loss, sw_val_bpb = eval_val_sliding(
             args, model, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
