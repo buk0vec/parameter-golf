@@ -116,6 +116,9 @@ class Hyperparameters:
     # Path to a saved .int8.ptz checkpoint. When set, skips training entirely
     # and runs only the eval suite (simple, sliding window, TTT) on the loaded weights.
     eval_checkpoint: str = os.environ.get("EVAL_CHECKPOINT", "")
+    # Skip the fast non-overlapping eval_val pass and go straight to sliding/TTT.
+    # Useful when EVAL_STRIDE is set and you don't want to wait for the simple eval.
+    skip_simple_eval: bool = bool(int(os.environ.get("SKIP_SIMPLE_EVAL", "0")))
 
     @property
     def train_files(self) -> str:
@@ -976,13 +979,18 @@ class BigramState:
         return np.log(P + 1e-40).astype(np.float32)
 
     def update_alpha(self, sc_prev: np.ndarray, sc_tgt: np.ndarray,
-                     nll_neural: np.ndarray, log_P: np.ndarray) -> None:
-        """PAQ-style per-chunk alpha update.
+                     e_log_bigram: np.ndarray, log_P: np.ndarray) -> None:
+        """Exact gradient update for alpha (product-of-experts combined loss).
 
-        alpha increases when bigram beats neural on average, decreases otherwise.
+        The combined loss L = -log P_neural(x_t) - alpha*log P_bigram(x_t) + log Z(alpha)
+        has gradient dL/dalpha = E_combined[log P_bigram(b)] - log P_bigram(x_t).
+        Gradient descent: alpha -= lr * dL/dalpha
+                        = alpha + lr * (log P_bigram(x_t) - E_combined[log P_bigram(b)])
+        When x_t is more bigram-predictable than the combined model expected, alpha grows.
+        The E_combined term acts as a partition-function correction preventing overshoot.
         """
-        nll_bigram = -log_P[sc_prev, sc_tgt].astype(np.float64)
-        delta = float(nll_neural.astype(np.float64).mean()) - float(nll_bigram.mean())
+        log_bigram_xt = log_P[sc_prev, sc_tgt].astype(np.float64)
+        delta = float(log_bigram_xt.mean()) - float(e_log_bigram.astype(np.float64).mean())
         self.alpha = float(np.clip(self.alpha + self.alpha_lr * delta, 0.0, self.alpha_max))
 
 
@@ -1039,9 +1047,9 @@ def eval_val_ttt(
                       if min(ws + seq_len, chunk_end) - ws >= 1]
 
         # Lists for per-chunk alpha update (only used when bigram enabled)
-        sc_prev_list:   list[np.ndarray] = []
-        sc_tgt_list:    list[np.ndarray] = []
-        nll_neural_list: list[np.ndarray] = []
+        sc_prev_list:    list[np.ndarray] = []
+        sc_tgt_list:     list[np.ndarray] = []
+        e_log_bigram_list: list[np.ndarray] = []  # E_combined[log P_bigram] per scored token
 
         for bi in range(0, len(win_starts), batch_seqs):
             batch_ws = win_starts[bi:bi + batch_seqs]
@@ -1062,19 +1070,21 @@ def eval_val_ttt(
 
             hidden = model(x).reshape(bsz * seq_len, -1)
             logits = model.softcap(hidden @ model.tok_emb.weight.astype(hidden.dtype).T).astype(mx.float32)
-            nll_base = nn.losses.cross_entropy(logits, y.reshape(-1), reduction="none")
 
             if log_P_mx is not None:
                 prev_flat   = mx.array(x_np.reshape(-1))
-                correction  = log_P_mx[prev_flat]          # [bsz*seq_len, V]
+                correction  = log_P_mx[prev_flat]                      # [bsz*seq_len, V]
                 logits_corr = logits + bigram.alpha * correction
                 nll_scored  = nn.losses.cross_entropy(logits_corr, y.reshape(-1), reduction="none")
-                mx.eval(nll_scored, nll_base)
-                nll_neural_np = np.array(nll_base, copy=False).reshape(bsz, seq_len)
+                # Exact gradient needs E_combined[log P_bigram(b)] = sum_b P_combined(b)*log P_bigram(b)
+                # correction already equals log P_bigram(b|prev) for each row
+                e_lb = (mx.softmax(logits_corr) * correction).sum(axis=-1)  # [bsz*seq_len]
+                mx.eval(nll_scored, e_lb)
+                e_lb_np = np.array(e_lb, copy=False).reshape(bsz, seq_len)
             else:
-                nll_scored = nll_base
+                nll_scored = nn.losses.cross_entropy(logits, y.reshape(-1), reduction="none")
                 mx.eval(nll_scored)
-                nll_neural_np = None
+                e_lb_np = None
 
             nll_np = np.array(nll_scored, copy=False).reshape(bsz, seq_len)
 
@@ -1091,14 +1101,14 @@ def eval_val_ttt(
                 if bigram is not None:
                     sc_prev_list.append(prev)
                     sc_tgt_list.append(tgt)
-                    nll_neural_list.append(nll_neural_np[i, s:wlen])
+                    e_log_bigram_list.append(e_lb_np[i, s:wlen])
 
         # Update bigram state after scoring the whole chunk
         if bigram is not None and sc_prev_list:
-            all_prev   = np.concatenate(sc_prev_list)
-            all_tgt    = np.concatenate(sc_tgt_list)
-            all_neural = np.concatenate(nll_neural_list)
-            bigram.update_alpha(all_prev, all_tgt, all_neural, log_P_np)
+            all_prev  = np.concatenate(sc_prev_list)
+            all_tgt   = np.concatenate(sc_tgt_list)
+            all_e_lb  = np.concatenate(e_log_bigram_list)
+            bigram.update_alpha(all_prev, all_tgt, all_e_lb, log_P_np)
             chunk_slice = val_tokens[chunk_start:chunk_end + 1]
             bigram.update(chunk_slice[:-1], chunk_slice[1:], bos_id)
 
@@ -1288,12 +1298,13 @@ def main() -> None:
         model.update(tree_unflatten(list(quant_flat.items())))
         log(f"checkpoint_loaded bytes:{ckpt_path.stat().st_size}")
 
-        ck_t0 = time.perf_counter()
-        ck_val_loss, ck_val_bpb = eval_val(
-            args, compiled_loss, val_tokens, base_bytes_lut,
-            has_leading_space_lut, is_boundary_token_lut, log_fn=log,
-        )
-        log(f"checkpoint_eval val_loss:{ck_val_loss:.4f} val_bpb:{ck_val_bpb:.4f} eval_time:{1000*(time.perf_counter()-ck_t0):.0f}ms")
+        if not args.skip_simple_eval:
+            ck_t0 = time.perf_counter()
+            ck_val_loss, ck_val_bpb = eval_val(
+                args, compiled_loss, val_tokens, base_bytes_lut,
+                has_leading_space_lut, is_boundary_token_lut, log_fn=log,
+            )
+            log(f"checkpoint_eval val_loss:{ck_val_loss:.4f} val_bpb:{ck_val_bpb:.4f} eval_time:{1000*(time.perf_counter()-ck_t0):.0f}ms")
 
         if args.eval_stride > 0:
             sw_t0 = time.perf_counter()
@@ -1443,19 +1454,20 @@ def main() -> None:
         quant_blob_disk = f.read()
     quant_flat = dequantize_state_dict_int8(pickle.loads(zlib.decompress(quant_blob_disk)))
     model.update(tree_unflatten(list(quant_flat.items())))
-    q_t0 = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
-        args,
-        compiled_loss,
-        val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
-        log_fn=log,
-    )
-    q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)
-    log(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
-    log(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    if not args.skip_simple_eval:
+        q_t0 = time.perf_counter()
+        q_val_loss, q_val_bpb = eval_val(
+            args,
+            compiled_loss,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            log_fn=log,
+        )
+        q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)
+        log(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
+        log(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
     if args.eval_stride > 0:
         sw_t0 = time.perf_counter()
