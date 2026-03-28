@@ -106,11 +106,15 @@ class Hyperparameters:
     ttt_grad_clip: float = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
     ttt_batch_seqs: int = int(os.environ.get("TTT_BATCH_SEQS", 32))
 
-    # Bigram mixing: two-level online KT table mixed into neural logits.
+    # Bigram mixing: two-level online KT table linearly interpolated with neural.
+    # P_combined = (1-lambda)*P_neural + lambda*P_bigram
+    # lambda update: lambda += lr * mean((P_bigram(x_t) - P_neural(x_t)) / P_combined(x_t))
+    # BIGRAM_MIX_FIXED=1 disables lambda updates (holds at BIGRAM_MIX_ALPHA_INIT).
     bigram_mix_enabled: bool = bool(int(os.environ.get("BIGRAM_MIX_ENABLED", "0")))
+    bigram_mix_fixed: bool = bool(int(os.environ.get("BIGRAM_MIX_FIXED", "0")))
     bigram_mix_alpha_init: float = float(os.environ.get("BIGRAM_MIX_ALPHA_INIT", 0.1))
     bigram_mix_alpha_lr: float = float(os.environ.get("BIGRAM_MIX_ALPHA_LR", 0.01))
-    bigram_mix_alpha_max: float = float(os.environ.get("BIGRAM_MIX_ALPHA_MAX", 2.0))
+    bigram_mix_alpha_max: float = float(os.environ.get("BIGRAM_MIX_ALPHA_MAX", 1.0))
 
     out_dir: str = os.environ.get("OUT_DIR", "logs")
     # Path to a saved .int8.ptz checkpoint. When set, skips training entirely
@@ -895,23 +899,29 @@ def eval_val_sliding(
         log_P_mx = mx.array(log_P_np) if log_P_np is not None else None
 
         if log_P_mx is not None:
-            prev_flat  = mx.array(x_np.reshape(-1))
-            correction = log_P_mx[prev_flat]                            # [bsz*seq_len, V]
-            logits_corr = logits + bigram.alpha * correction
-            nll  = nn.losses.cross_entropy(logits_corr, y.reshape(-1), reduction="none")
-            e_lb = (mx.softmax(logits_corr) * correction).sum(axis=-1) # [bsz*seq_len]
-            mx.eval(nll, e_lb)
-            e_lb_np = np.array(e_lb, copy=False).reshape(bsz, seq_len)
+            prev_flat = mx.array(x_np.reshape(-1))
+            p_bigram  = mx.exp(log_P_mx[prev_flat])          # [bsz*seq_len, V]
+            p_neural  = mx.softmax(logits)                   # [bsz*seq_len, V]
+            p_comb    = (1.0 - bigram.alpha) * p_neural + bigram.alpha * p_bigram
+            arange    = mx.arange(bsz * seq_len)
+            y_flat    = y.reshape(-1)
+            p_comb_xt   = p_comb[arange, y_flat]             # [bsz*seq_len]
+            p_neural_xt = p_neural[arange, y_flat]
+            p_bigram_xt = p_bigram[arange, y_flat]
+            nll      = -mx.log(p_comb_xt + 1e-40)
+            grad_lam = (p_bigram_xt - p_neural_xt) / (p_comb_xt + 1e-40)
+            mx.eval(nll, grad_lam)
+            grad_lam_np = np.array(grad_lam, copy=False).reshape(bsz, seq_len)
         else:
             nll = nn.losses.cross_entropy(logits, y.reshape(-1), reduction="none")
             mx.eval(nll)
-            e_lb_np = None
+            grad_lam_np = None
 
         nll_np = np.array(nll, dtype=np.float64).reshape(bsz, seq_len)
 
         sc_prev_list: list[np.ndarray] = []
         sc_tgt_list:  list[np.ndarray] = []
-        sc_elb_list:  list[np.ndarray] = []
+        sc_grad_list: list[np.ndarray] = []
 
         for i, ws in enumerate(batch_ws):
             wlen = wlens[i]
@@ -928,14 +938,14 @@ def eval_val_sliding(
             if bigram is not None:
                 sc_prev_list.append(prev)
                 sc_tgt_list.append(tgt)
-                sc_elb_list.append(e_lb_np[i, s:wlen])
+                sc_grad_list.append(grad_lam_np[i, s:wlen])
 
-        # Score-first: update alpha and bigram counts after scoring this batch
+        # Score-first: update lambda and bigram counts after scoring this batch
         if bigram is not None and sc_prev_list:
             all_prev = np.concatenate(sc_prev_list)
             all_tgt  = np.concatenate(sc_tgt_list)
-            all_elb  = np.concatenate(sc_elb_list)
-            bigram.update_alpha(all_prev, all_tgt, all_elb, log_P_np)
+            if not args.bigram_mix_fixed:
+                bigram.update_alpha(float(np.concatenate(sc_grad_list).mean()))
             bigram.update(all_prev, all_tgt, bos_id)
 
         if log_fn is not None and (
@@ -1012,20 +1022,18 @@ class BigramState:
         P    = lam * P_l + (1.0 - lam) * P_g
         return np.log(P + 1e-40).astype(np.float32)
 
-    def update_alpha(self, sc_prev: np.ndarray, sc_tgt: np.ndarray,
-                     e_log_bigram: np.ndarray, log_P: np.ndarray) -> None:
-        """Exact gradient update for alpha (product-of-experts combined loss).
+    def update_alpha(self, grad_signal: float) -> None:
+        """Gradient update for lambda (linear interpolation mixture).
 
-        The combined loss L = -log P_neural(x_t) - alpha*log P_bigram(x_t) + log Z(alpha)
-        has gradient dL/dalpha = E_combined[log P_bigram(b)] - log P_bigram(x_t).
-        Gradient descent: alpha -= lr * dL/dalpha
-                        = alpha + lr * (log P_bigram(x_t) - E_combined[log P_bigram(b)])
-        When x_t is more bigram-predictable than the combined model expected, alpha grows.
-        The E_combined term acts as a partition-function correction preventing overshoot.
+        P_combined = (1-lambda)*P_neural + lambda*P_bigram
+        L = -log P_combined(x_t)
+        dL/dlambda = -(P_bigram(x_t) - P_neural(x_t)) / P_combined(x_t)
+
+        grad_signal = mean((P_bigram(x_t) - P_neural(x_t)) / P_combined(x_t))
+        Lambda grows when bigram assigns higher probability to the true token than neural.
+        No partition function correction needed — linear mixture is already normalized.
         """
-        log_bigram_xt = log_P[sc_prev, sc_tgt].astype(np.float64)
-        delta = float(log_bigram_xt.mean()) - float(e_log_bigram.astype(np.float64).mean())
-        self.alpha = float(np.clip(self.alpha + self.alpha_lr * delta, 0.0, self.alpha_max))
+        self.alpha = float(np.clip(self.alpha + self.alpha_lr * grad_signal, 0.0, self.alpha_max))
 
 
 def eval_val_ttt(
@@ -1106,19 +1114,23 @@ def eval_val_ttt(
             logits = model.softcap(hidden @ model.tok_emb.weight.astype(hidden.dtype).T).astype(mx.float32)
 
             if log_P_mx is not None:
-                prev_flat   = mx.array(x_np.reshape(-1))
-                correction  = log_P_mx[prev_flat]                      # [bsz*seq_len, V]
-                logits_corr = logits + bigram.alpha * correction
-                nll_scored  = nn.losses.cross_entropy(logits_corr, y.reshape(-1), reduction="none")
-                # Exact gradient needs E_combined[log P_bigram(b)] = sum_b P_combined(b)*log P_bigram(b)
-                # correction already equals log P_bigram(b|prev) for each row
-                e_lb = (mx.softmax(logits_corr) * correction).sum(axis=-1)  # [bsz*seq_len]
-                mx.eval(nll_scored, e_lb)
-                e_lb_np = np.array(e_lb, copy=False).reshape(bsz, seq_len)
+                prev_flat = mx.array(x_np.reshape(-1))
+                p_bigram  = mx.exp(log_P_mx[prev_flat])      # [bsz*seq_len, V]
+                p_neural  = mx.softmax(logits)               # [bsz*seq_len, V]
+                p_comb    = (1.0 - bigram.alpha) * p_neural + bigram.alpha * p_bigram
+                arange    = mx.arange(bsz * seq_len)
+                y_flat    = y.reshape(-1)
+                p_comb_xt   = p_comb[arange, y_flat]
+                p_neural_xt = p_neural[arange, y_flat]
+                p_bigram_xt = p_bigram[arange, y_flat]
+                nll_scored = -mx.log(p_comb_xt + 1e-40)
+                grad_lam   = (p_bigram_xt - p_neural_xt) / (p_comb_xt + 1e-40)
+                mx.eval(nll_scored, grad_lam)
+                grad_lam_np = np.array(grad_lam, copy=False).reshape(bsz, seq_len)
             else:
                 nll_scored = nn.losses.cross_entropy(logits, y.reshape(-1), reduction="none")
                 mx.eval(nll_scored)
-                e_lb_np = None
+                grad_lam_np = None
 
             nll_np = np.array(nll_scored, copy=False).reshape(bsz, seq_len)
 
@@ -1135,14 +1147,14 @@ def eval_val_ttt(
                 if bigram is not None:
                     sc_prev_list.append(prev)
                     sc_tgt_list.append(tgt)
-                    e_log_bigram_list.append(e_lb_np[i, s:wlen])
+                    e_log_bigram_list.append(grad_lam_np[i, s:wlen])
 
         # Update bigram state after scoring the whole chunk
         if bigram is not None and sc_prev_list:
-            all_prev  = np.concatenate(sc_prev_list)
-            all_tgt   = np.concatenate(sc_tgt_list)
-            all_e_lb  = np.concatenate(e_log_bigram_list)
-            bigram.update_alpha(all_prev, all_tgt, all_e_lb, log_P_np)
+            all_prev = np.concatenate(sc_prev_list)
+            all_tgt  = np.concatenate(sc_tgt_list)
+            if not args.bigram_mix_fixed:
+                bigram.update_alpha(float(np.concatenate(e_log_bigram_list).mean()))
             chunk_slice = val_tokens[chunk_start:chunk_end + 1]
             bigram.update(chunk_slice[:-1], chunk_slice[1:], bos_id)
 
